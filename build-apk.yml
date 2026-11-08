@@ -1,0 +1,126 @@
+# Save as:  .github/workflows/build-apk.yml   (on your default branch, e.g. main)
+#
+# The bot commits the user's HTML to www/index.html on a temporary branch and
+# dispatches this workflow on that branch. The Android project is generated on
+# the fly with Capacitor (a WebView wrapper), so the repo needs no Android files.
+
+name: Build APK
+run-name: Build APK ${{ inputs.job_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: "Unique build id (set by the bot)"
+        required: true
+        type: string
+      app_name:
+        description: "App display name"
+        required: true
+        default: "My App"
+        type: string
+      package_id:
+        description: "Android package id, e.g. com.htmlapk.u123.appmyapp"
+        required: true
+        default: "com.htmlapk.app"
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Inputs are passed through env vars (never interpolated into shell code)
+      # so a hostile app name cannot inject commands.
+      JOB_ID: ${{ inputs.job_id }}
+      APP_NAME: ${{ inputs.app_name }}
+      APP_ID: ${{ inputs.package_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Validate inputs
+        run: |
+          set -euo pipefail
+          id_pattern='^[A-Za-z0-9_-]{1,40}$'
+          pkg_pattern='^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$'
+          [[ "$JOB_ID" =~ $id_pattern ]]  || { echo "::error::Invalid job_id"; exit 1; }
+          [[ "$APP_ID" =~ $pkg_pattern ]] || { echo "::error::Invalid package_id"; exit 1; }
+          test -f www/index.html          || { echo "::error::www/index.html is missing"; exit 1; }
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Generate Capacitor Android project
+        run: |
+          set -euo pipefail
+          npm init -y > /dev/null
+          npm install --no-audit --no-fund @capacitor/core@6 @capacitor/cli@6 @capacitor/android@6
+          jq -n --arg id "$APP_ID" --arg name "$APP_NAME" \
+            '{appId: $id, appName: $name, webDir: "www"}' > capacitor.config.json
+          npx cap add android
+          npx cap sync android
+
+      - name: Build release APK (unsigned)
+        working-directory: android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease --no-daemon --stacktrace
+
+      - name: Align and sign APK
+        env:
+          # Optional. Without these, a throw-away key is generated (installable,
+          # but each build has a different signature so it can't update an old install).
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          BT="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)"
+          UNSIGNED="$(ls android/app/build/outputs/apk/release/*.apk | head -1)"
+          mkdir -p out
+
+          if [ -n "${KEYSTORE_BASE64:-}" ]; then
+            echo "Signing with the keystore from repository secrets"
+            echo "$KEYSTORE_BASE64" | base64 -d > release.jks
+            KS_PASS="$KEYSTORE_PASSWORD"
+            ALIAS="$KEY_ALIAS"
+            K_PASS="${KEY_PASSWORD:-$KEYSTORE_PASSWORD}"
+          else
+            echo "No keystore secrets found - signing with a temporary key"
+            keytool -genkeypair -keystore release.jks -storepass android -keypass android \
+              -alias temp -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=HTML2APK"
+            KS_PASS="android"
+            ALIAS="temp"
+            K_PASS="android"
+          fi
+
+          "$BT/zipalign" -f -p 4 "$UNSIGNED" out/aligned.apk
+          "$BT/apksigner" sign \
+            --ks release.jks --ks-pass "pass:$KS_PASS" \
+            --ks-key-alias "$ALIAS" --key-pass "pass:$K_PASS" \
+            --out "out/app-${JOB_ID}.apk" out/aligned.apk
+          "$BT/apksigner" verify "out/app-${JOB_ID}.apk"
+          rm -f release.jks
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.job_id }}
+          path: out/app-${{ inputs.job_id }}.apk
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
